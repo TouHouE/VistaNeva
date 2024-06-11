@@ -176,18 +176,15 @@ class NevaWordEmbeddingMixin(torch.nn.Module, adapter_mixins.AdapterModuleMixin)
 
         vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
         vision_x = vision_x.to(self.vision_encoder.dtype)
-        with torch.no_grad():
-            if self.from_hf:
-                vision_x = self.vision_encoder(vision_x, output_hidden_states=True)
-                vision_x = vision_x.hidden_states[self.vision_select_layer]
-            else:
-                self.vision_encoder.backbone.transformer.return_select_layer = self.vision_select_layer
-                vision_x = self.vision_encoder(vision_x)
+
+        vision_x = self.vision_encoder(vision_x, output_hidden_states=True)
+        vision_x = vision_x.hidden_states[self.vision_select_layer]
+
         vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
         vision_x = vision_x[:, :, :, self.class_token_length :]
         assert self.is_adapter_available(), "Cannot find multimodal vision adapter!"
         vision_connector = self.get_adapter_module(AdapterName.MULTIMODAL_PROJECTOR_ADAPTER)
-        vision_x = vision_connector(vision_x)
+        vision_x = vision_connector(vision_x.permute(0, 1, 2, 4, 3))
         return vision_x
 
     def replace_media_embeddings(self, input_ids, inputs_embeds, media):
@@ -210,6 +207,7 @@ class NevaWordEmbeddingMixin(torch.nn.Module, adapter_mixins.AdapterModuleMixin)
         padded_media_indices *= sequence_length
         for idx, input_id in enumerate(input_ids):
             media_end_positions = torch.where(input_id == self.media_end_id)[0]
+
             if self.use_im_start_end:
                 # locate the first media token positions
                 padded_media_indices[idx, : len(media_end_positions)] = media_end_positions - num_patches
@@ -296,7 +294,9 @@ class NevaBaseModel:
 
     def create_vision_encoder_and_processor(self, mm_cfg):
         # Initialize vision encoder and freeze it
-        if mm_cfg.vision_encoder.get("from_hf", False):
+        vista_cfg = getattr(mm_cfg, 'vista', None)
+
+        if mm_cfg.vision_encoder.get("from_hf", False) and vista_cfg is None:
             if "clip" in mm_cfg.vision_encoder.from_pretrained:
                 vision_encoder = CLIPVisionModel.from_pretrained(
                     mm_cfg.vision_encoder.from_pretrained,
@@ -319,7 +319,7 @@ class NevaBaseModel:
                     vision_encoder = vision_encoder.eval()
             else:
                 raise (ValueError("Currently only support CLIPVisionModel and SigLipVisionModel from Huggingface"))
-        else:
+        elif vista_cfg is None:
             vision_cfg = MegatronCLIPModel.restore_from(
                 mm_cfg.vision_encoder.from_pretrained, return_config=True
             ).vision
@@ -327,6 +327,52 @@ class NevaBaseModel:
             self.load_vision_encoder_weights(vision_encoder, mm_cfg.vision_encoder.from_pretrained)
             if mm_cfg.vision_encoder.freeze:
                 vision_encoder.freeze()
+        else:
+            try:
+                from npo.beato.models import vista2pt5
+            except Exception as E:
+                import importlib
+                import sys
+                module_name = 'npo.beato.models.vista2pt5'
+                spec = importlib.util.spec_from_file_location(
+                    module_name, '/mnt/workspace/neva/neva/ToolKit/npo/beato/models/vista2pt5.py'
+                )
+                vista2pt5 = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(vista2pt5)
+                sys.modules[module_name] = vista2pt5
+            _cfg = vista_cfg
+            model_type: str = getattr(_cfg, 'model_type', 'vit-b')
+            ckpt: Optional[str] = getattr(_cfg, 'ckpt', None)
+            img_size: int = getattr(_cfg, 'img_size', 512)
+            embed_3d: bool = getattr(_cfg, 'embed_3d', True)
+            encoder_in_chans: int = getattr(_cfg, 'in_chans', 81)
+            freeze_vista: bool = getattr(_cfg, 'freeze', False)
+            stride: int = getattr(_cfg, 'stride', 1)
+            random_k: int = getattr(_cfg, 'random_k', None)
+            mixer_type: str = getattr(_cfg, 'mixer_type', 'avg')
+            info = f"Vista Setting:\n"
+            info += f"- type: {model_type}\n"
+            info += f"- ckpt: {ckpt}\n"
+            info += f"- img_size: {img_size}\n"
+            info += f"- embed_3d: {embed_3d}\n"
+            info += f"- encoder_in_channs: {encoder_in_chans}\n"
+            info += f"- mixer_type: {mixer_type}"
+            print(info)
+
+            vision_encoder = vista2pt5.vista_vit_builder(
+                model_type, ckpt,
+                stride=stride, random_k=random_k,
+                image_size=img_size, patch_embed_3d=embed_3d,
+                encoder_in_chans=encoder_in_chans,
+                mixer_type=mixer_type
+            )
+
+            if freeze_vista:
+                for param in vision_encoder.parameters():
+                    param.requires_grad = False
+                vision_encoder.eval()
+            print(vision_encoder)
+            vision_encoder.cuda()
 
         image_processor = create_image_processor(mm_cfg)
 

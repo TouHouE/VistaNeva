@@ -186,9 +186,27 @@ def get_nmt_tokenizer(
         )
     elif library == 'sentencepiece':
         logging.info(f'Getting SentencePiece with model: {tokenizer_model}')
-        return nemo.collections.common.tokenizers.sentencepiece_tokenizer.SentencePieceTokenizer(
+        tokenizer = nemo.collections.common.tokenizers.sentencepiece_tokenizer.SentencePieceTokenizer(
             model_path=tokenizer_model, legacy=legacy
         )
+        if legacy:
+            from nemo.collections.multimodal.data.neva.conversation import (
+                DEFAULT_PAD_TOKEN,
+                DEFAULT_BOS_TOKEN,
+                DEFAULT_EOS_TOKEN
+            )
+            token_dict = {
+                'pad_token': DEFAULT_PAD_TOKEN,
+                'bos_token': DEFAULT_BOS_TOKEN,
+                'eos_token': DEFAULT_EOS_TOKEN
+            }
+            token_dict = omegaconf.DictConfig(token_dict)
+            tokenizer.add_special_tokens(
+                omegaconf.OmegaConf.to_object(token_dict)
+            )
+            return tokenizer
+
+
     elif library == 'byte-level':
         logging.info(f'Using byte-level tokenization')
         return ByteLevelTokenizer(special_tokens_dict)

@@ -19,6 +19,9 @@ import re
 import tarfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple, Union
+import monai.transforms as MF
+from torchvision import transforms as TF
+
 
 import decord
 import numpy as np
@@ -40,6 +43,8 @@ from nemo.collections.multimodal.data.neva.conversation import (
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_LABELS_TOKEN,
     DEFAULT_VIDEO_TOKEN,
+    DEFAULT_BOS_TOKEN,
+    DEFAULT_EOS_TOKEN
 )
 from nemo.collections.nlp.modules.common.megatron.utils import get_ltor_masks_and_position_ids
 
@@ -82,6 +87,7 @@ class TarOrFolderImageLoader:
         self.tar_index = {}
         if self.image_folder.endswith('.tar'):
             self.build_index()
+        self.nii_loader = MF.LoadImage()
 
     def build_index(self):
         with tarfile.open(self.image_folder, 'r') as tar:
@@ -95,8 +101,13 @@ class TarOrFolderImageLoader:
                 if member:
                     f = tar.extractfile(member)
                     return Image.open(f).convert('RGB')
-        else:
+        elif file_name.split('.')[-1].lower() in ['jpg', 'jpeg', 'gif', 'png', 'tiff', 'bmp']:
             return Image.open(os.path.join(self.image_folder, file_name)).convert('RGB')
+        try:
+            return self.nii_loader(os.path.join(self.image_folder, file_name))
+        except Exception as E:
+            import traceback
+            traceback.format_exc()
         return None
 
 
@@ -248,7 +259,7 @@ def preprocess_multimodal(sources: dict, multimodal_cfg: dict, cur_token_len: in
     is_multimodal = multimodal_cfg['is_multimodal']
     model_type = multimodal_cfg['model_type']
     media_type = multimodal_cfg['media_type']
-    image_token_len = cur_token_len
+    image_token_len = cur_token_len  # 1024
     if media_type == 'image':
         default_token = DEFAULT_IMAGE_TOKEN
     elif media_type == 'video':
@@ -470,23 +481,35 @@ def preprocess_llama_2(
         add_extra_token=add_extra_token,
     )
 
+    img_patch_ids = tokenizer.text_to_ids(DEFAULT_IMAGE_PATCH_TOKEN['llama_2'])
+    img_patch_ids = img_patch_ids if not isinstance(img_patch_ids, list) else img_patch_ids[0]
+    bos_ids = tokenizer.text_to_ids(DEFAULT_BOS_TOKEN)
+    eos_ids = tokenizer.text_to_ids(DEFAULT_EOS_TOKEN)
+    bos_ids = bos_ids if not isinstance(bos_ids, list) else bos_ids[0]
+    eos_ids = eos_ids if not isinstance(eos_ids, list) else eos_ids[0]
+    img_start_ids = tokenizer.text_to_ids(DEFAULT_IM_START_TOKEN['llama_2'])
+    img_start_id = tokenizer.token_to_id(DEFAULT_IM_START_TOKEN['llama_2'])
+    img_end_ids = tokenizer.text_to_ids(DEFAULT_IM_END_TOKEN['llama_2'])
+    img_end_id = tokenizer.token_to_id(DEFAULT_IM_END_TOKEN['llama_2'])
+
     # llama tricks
-    tokens[tokens == 32003] = 0  # DEFAULT_IMAGE_PATCH_TOKEN
-    tokens[tokens == 32006] = 1  # <s>
-    tokens[tokens == 32007] = 2  # </s>
+    tokens[tokens == img_patch_ids] = 0  # DEFAULT_IMAGE_PATCH_TOKEN
+    tokens[tokens == bos_ids] = 1  # <s>
+    tokens[tokens == eos_ids] = 2  # </s>
     labels = tokens.clone().detach()
 
     # Mask labels
     sep = "[/INST] "
     for conversation, target in zip(conversations, labels):
-        rounds = conversation.split(conv.sep2)
+        rounds = conversation.split(conv.sep2) # EOS --> <extra_id_7>
         cur_len = 0
         for i, rou in enumerate(rounds):
-
+            print(f'i-{i}, rou: {rou}')
             if rou == "":
                 break
 
-            parts = rou.split(sep)
+            parts = rou.split(sep) # [/INST]
+            print(f'parts: {parts}, len: {len(parts)}')
             if len(parts) != 2:
                 break
             parts[0] += sep
@@ -911,9 +934,31 @@ class LazySupervisedDataset(Dataset):
         self.image_folder = multimodal_cfg['image_folder']
         self.video_folder = multimodal_cfg['video_folder']
         self.processor = multimodal_cfg["image_processor"]
+        self.axer = MF.Orientation(axcodes='RAS')
+        self.scaler = MF.ScaleIntensity(
+            a_min=-1024, a_max=1024,
+            b_min=-1, b_max=1,
+            clip=True
+        )
+        self.specier = MF.Spacing((1, 1, 1))
+        self.channler = MF.EnsureChannelFirst()
+        self.resizer = MF.Resize((512, 512, 320))
+
 
         self.image_loader = TarOrFolderImageLoader(self.image_folder) if self.image_folder else None
         self.video_loader = TarOrFolderVideoLoader(self.video_folder, data_cfg) if self.video_folder else None
+
+    def preprocess_ct(self, ct_image):
+        ct_image = self.channler(ct_image)
+        if len(ct_image.shape) <= 4:
+            ct_image = self.axer(ct_image)
+            ct_image = self.specier(ct_image)
+            ct_image = self.resizer(ct_image)
+        else:
+            ct_image = ct_image.squeeze(2).permute(1, 2, 3, 0)
+            ct_image = F.interpolate(ct_image.unsqueeze(0), size=(512, 512, 320), mode='trilinear').squeeze(0)
+
+        return ct_image
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -932,24 +977,12 @@ class LazySupervisedDataset(Dataset):
                 image = self.image_loader.open_image(image_file)
                 if image is None:
                     logging.warning(f"Image {image_file} could not be found!")
-                image = process_image(self.processor, image, self.multimodal_cfg['image_aspect_ratio'])
+                image = self.preprocess_ct(image)
                 images.append(image)
             media_tensors = torch.tensor([])
             if images:
                 media_tensors = torch.stack(images)
-                patch_dim = self.multimodal_cfg['patch_dim']
-
-                height_num_patches = media_tensors[0].shape[1] // patch_dim
-                width_num_patches = media_tensors[0].shape[2] // patch_dim
-
-                if self.multimodal_cfg['mm_mlp_adapter_type'] == 'mlp_downsample':
-                    if height_num_patches % 2 != 0:
-                        height_num_patches += 1
-                    if width_num_patches % 2 != 0:
-                        width_num_patches += 1
-
-                cur_token_len = height_num_patches * width_num_patches
-
+                cur_token_len = (512 // 16) ** 2
                 sources = preprocess_multimodal(
                     copy.deepcopy(sources),
                     self.multimodal_cfg,
@@ -1080,7 +1113,7 @@ class LazySupervisedDataset(Dataset):
             # TODO, if there are different videos on T dimensions.
             if media_tensors.shape[0] < MAX_NUM_IMAGES:
                 padding_size = MAX_NUM_IMAGES - media_tensors.shape[0]
-                zero_padding = torch.zeros((padding_size, 3, crop_size[0], crop_size[1]), dtype=torch.float)
+                zero_padding = torch.zeros((padding_size, 1, 512, 512, 320), dtype=torch.float)
                 media_tensors = torch.cat((media_tensors, zero_padding), dim=0)
 
             if self.multimodal_cfg['media_type'] == 'image':
