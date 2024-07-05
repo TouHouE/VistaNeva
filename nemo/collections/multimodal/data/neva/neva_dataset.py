@@ -935,7 +935,7 @@ class LazySupervisedDataset(Dataset):
         self.video_folder = multimodal_cfg['video_folder']
         self.processor = multimodal_cfg["image_processor"]
         self.axer = MF.Orientation(axcodes='RAS')
-        self.scaler = MF.ScaleIntensity(
+        self.scaler = MF.ScaleIntensityRange(
             a_min=-1024, a_max=1024,
             b_min=-1, b_max=1,
             clip=True

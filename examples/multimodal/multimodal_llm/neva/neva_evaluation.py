@@ -53,7 +53,11 @@ class RequestDataSet(Dataset):
 @hydra_runner(config_path="conf", config_name="neva_inference")
 def main(cfg) -> None:
     model, image_processor, video_processor = create_neva_model_and_processor(cfg)
-
+    model.tokenizer.add_special_tokens({
+        "pad_token": "<pad>",
+        "bos_token": "<extra_id_6>",
+        "eos_token": <""
+    })
     length_params: LengthParam = {
         "max_length": cfg.inference.tokens_to_generate,
         "min_length": cfg.inference.min_tokens_to_generate,

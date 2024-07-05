@@ -116,12 +116,22 @@ def get_tokenizer(
 
     if tokenizer_name == 'sentencepiece':
         logging.info("tokenizer_model: " + str(tokenizer_model))
-        return nemo.collections.common.tokenizers.sentencepiece_tokenizer.SentencePieceTokenizer(
+        tokenizer = nemo.collections.common.tokenizers.sentencepiece_tokenizer.SentencePieceTokenizer(
             model_path=tokenizer_model,
             special_tokens=special_tokens,
             legacy=True,
             chat_template=chat_template,
         )
+        token_dict = {
+            'pad_token': "<pad>",
+            "bos_token": "<extra_id_6>",
+            'eos_token': '<extra_id_7>'
+        }
+        token_dict = omegaconf.DictConfig(token_dict)
+        token_dict = omegaconf.OmegaConf.to_object(token_dict)
+
+        tokenizer.add_special_tokens(token_dict)
+
     elif tokenizer_name == 'word':
         return WordTokenizer(vocab_file=vocab_file, **special_tokens_dict)
     elif tokenizer_name == 'char':

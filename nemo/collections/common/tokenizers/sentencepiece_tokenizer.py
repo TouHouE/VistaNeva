@@ -186,7 +186,8 @@ class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
     def add_special_tokens(self, special_tokens):
         if not self.legacy:
             raise AttributeError("Special Token addition does not work when legacy is set to False.")
-
+        import traceback
+        traceback.format_exc()
         if isinstance(special_tokens, list):
             for token in special_tokens:
                 if (
